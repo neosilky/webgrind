@@ -318,6 +318,10 @@
 			setTimeout(checkVersion,100);
 			<?php endif?>
 
+			$("#hideInternals").change(function(){
+				update();
+			});
+
 			$("#negateFilter").change(function(){
 				$('#callfilter').trigger('keyup');
 			});
@@ -353,8 +357,6 @@
 		<div id="options">
 			<form method="get" onsubmit="window.location.hash='';update();return false;">
 				<div style="float:right;margin-left:10px">
-					<input type="checkbox" name="hideInternals" value="1" <?php echo (Webgrind_Config::$defaultHideInternalFunctions==1) ? 'checked' : ''?> id="hideInternals">
-					<label for="hideInternals">Hide PHP functions</label>
 					<input type="submit" value="Update">
 					<input type="button" value="Clear Files" onclick="clearFiles()">
 				</div>
@@ -406,6 +408,8 @@
 			Filter: <input type="text" style="width:150px" id="callfilter"> (regex too)
 			<input type="checkbox" name="negateFilter" value="0" id="negateFilter">
 			<label for="negateFilter">Invert filter</label>
+			<input type="checkbox" name="hideInternals" value="1" <?php echo (Webgrind_Config::$defaultHideInternalFunctions==1) ? 'checked' : ''?> id="hideInternals">
+			<label for="hideInternals">Hide PHP functions</label>
 			<table class="tablesorter" id="function_table" cellspacing="0">
 				<thead>
 					<tr>
