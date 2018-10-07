@@ -352,13 +352,11 @@
 		</div>
 		<div id="options">
 			<form method="get" onsubmit="window.location.hash='';update();return false;">
-				<div style="float:right">
+				<div style="float:right;margin-left:10px">
 					<input type="checkbox" name="hideInternals" value="1" <?php echo (Webgrind_Config::$defaultHideInternalFunctions==1) ? 'checked' : ''?> id="hideInternals">
 					<label for="hideInternals">Hide PHP functions</label>
-					<input type="button" value="Clear Files" onclick="clearFiles()">
-				</div>
-                <div style="float:right;margin-left:10px">
 					<input type="submit" value="Update">
+					<input type="button" value="Clear Files" onclick="clearFiles()">
 				</div>
 				<div style="float:right;">
 					<label style="margin:0 5px">in</label>
