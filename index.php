@@ -11,10 +11,6 @@ class Webgrind_Config
 
     static $webgrindVersion = '1.5';
 
-    /**
-     * Automatically check if a newer version of webgrind is available for download
-     */
-    static $checkVersion = true;
     static $hideWebgrindProfiles = true;
 
     /**
@@ -149,18 +145,10 @@ class Webgrind_Config
     {
         $localBin = __DIR__ . '/bin/';
         $makeFailed = $localBin . 'make-failed';
-        if (PHP_OS == 'WINNT') {
-            $binary = $localBin . 'preprocessor.exe';
-        } else {
-            $binary = $localBin . 'preprocessor';
-        }
+        $binary = $localBin . 'preprocessor';
 
         if (!file_exists($binary) && is_writable($localBin) && !file_exists($makeFailed)) {
-            if (PHP_OS == 'WINNT') {
-                $success = static::compileBinaryPreprocessorWindows();
-            } else {
-                $success = static::compileBinaryPreprocessor();
-            }
+            $success = static::compileBinaryPreprocessor();
             if (!$success || !file_exists($binary)) {
                 touch($makeFailed);
             }
@@ -181,27 +169,525 @@ class Webgrind_Config
         }
         return false;
     }
+}
 
-    static function compileBinaryPreprocessorWindows()
+class Webgrind_Reader
+{
+    const FILE_FORMAT_VERSION = 7;
+
+    const NR_FORMAT = 'V';
+
+    const NR_SIZE = 4;
+
+    const ENTRY_POINT = '{main}';
+
+    const CALLINFORMATION_LENGTH = 4;
+
+    const FUNCTIONINFORMATION_LENGTH = 6;
+
+    private $headersPos;
+
+    private $functionPos;
+
+    private $headers = null;
+
+    private $costFormat;
+
+    function __construct($dataFile, $costFormat)
     {
-        if (getenv('VSAPPIDDIR')) {
-            $cwd = getcwd();
-            chdir(__DIR__);
-            exec('call "%VSAPPIDDIR%\..\Tools\vsdevcmd\ext\vcvars.bat" && nmake -f nmakefile', $output, $retval);
-            chdir($cwd);
-            return $retval == 0;
-        } elseif (getenv('VS140COMNTOOLS')) {
-            $cwd = getcwd();
-            chdir(__DIR__);
-            exec('call "%VS140COMNTOOLS%\vsvars32.bat" && nmake -f nmakefile', $output, $retval);
-            chdir($cwd);
-            return $retval == 0;
+        $this->fp = @fopen($dataFile, 'rb');
+        if (!$this->fp)
+            throw new Exception('Error opening file!');
+
+        $this->costFormat = $costFormat;
+        $this->init();
+    }
+
+    private function init()
+    {
+        list($version, $this->headersPos, $functionCount) = $this->read(3);
+        if ($version != self::FILE_FORMAT_VERSION)
+            throw new Exception('Datafile not correct version. Found ' . $version . ' expected ' . self::FILE_FORMAT_VERSION);
+        $this->functionPos = $this->read($functionCount);
+        if (!is_array($this->functionPos))
+            $this->functionPos = [$this->functionPos];
+    }
+
+    function getFunctionCount()
+    {
+        return count($this->functionPos);
+    }
+
+    function getFunctionInfo($nr)
+    {
+        $this->seek($this->functionPos[$nr]);
+
+        list($line, $summedSelfCost, $summedInclusiveCost, $invocationCount, $calledFromCount, $subCallCount) = $this->read(self::FUNCTIONINFORMATION_LENGTH);
+
+        $this->seek(self::NR_SIZE * self::CALLINFORMATION_LENGTH * ($calledFromCount + $subCallCount), SEEK_CUR);
+        $file = $this->readLine();
+        $function = $this->readLine();
+
+        $result = array(
+            'file' => $file,
+            'line' => $line,
+            'functionName' => $function,
+            'summedSelfCost' => $summedSelfCost,
+            'summedInclusiveCost' => $summedInclusiveCost,
+            'invocationCount' => $invocationCount,
+            'calledFromInfoCount' => $calledFromCount,
+            'subCallInfoCount' => $subCallCount
+        );
+        $result['summedSelfCostRaw'] = $result['summedSelfCost'];
+        $result['summedSelfCost'] = $this->formatCost($result['summedSelfCost']);
+        $result['summedInclusiveCost'] = $this->formatCost($result['summedInclusiveCost']);
+
+        return $result;
+    }
+
+    function getCalledFromInfo($functionNr, $calledFromNr)
+    {
+        $this->seek(
+            $this->functionPos[$functionNr]
+            + self::NR_SIZE
+            * (self::CALLINFORMATION_LENGTH * $calledFromNr + self::FUNCTIONINFORMATION_LENGTH)
+        );
+
+        $data = $this->read(self::CALLINFORMATION_LENGTH);
+
+        $result = array(
+            'functionNr' => $data[0],
+            'line' => $data[1],
+            'callCount' => $data[2],
+            'summedCallCost' => $data[3]
+        );
+
+        $result['summedCallCost'] = $this->formatCost($result['summedCallCost']);
+
+        return $result;
+    }
+
+    function getSubCallInfo($functionNr, $subCallNr)
+    {
+        // Sub call count is the second last number in the FUNCTION_INFORMATION block
+        $this->seek($this->functionPos[$functionNr] + self::NR_SIZE * (self::FUNCTIONINFORMATION_LENGTH - 2));
+        $calledFromInfoCount = $this->read();
+        $this->seek((($calledFromInfoCount + $subCallNr) * self::CALLINFORMATION_LENGTH + 1) * self::NR_SIZE, SEEK_CUR);
+        $data = $this->read(self::CALLINFORMATION_LENGTH);
+
+        $result = array(
+            'functionNr' => $data[0],
+            'line' => $data[1],
+            'callCount' => $data[2],
+            'summedCallCost' => $data[3]
+        );
+
+        $result['summedCallCost'] = $this->formatCost($result['summedCallCost']);
+
+        return $result;
+    }
+
+    function getHeader($header)
+    {
+        if ($this->headers == null) { // Cache headers
+            $this->seek($this->headersPos);
+            $this->headers = array(
+                'runs' => 0,
+                'summary' => 0,
+                'cmd' => '',
+                'creator' => '',
+            );
+            while ($line = $this->readLine()) {
+                $parts = explode(': ', $line);
+                if ($parts[0] == 'summary') {
+                    // According to https://github.com/xdebug/xdebug/commit/926808a6e0204f5835a617caa3581b45f6d82a6c#diff-1a570e993c4d7f2e341ba24905b8b2cdR355
+                    // summary now includes time + memory usage, webgrind only tracks the time from the summary
+                    $subParts = explode(' ', $parts[1]);
+                    $this->headers['runs']++;
+                    $this->headers['summary'] += $subParts[0];
+                } else {
+                    $this->headers[$parts[0]] = $parts[1];
+                }
+            }
         }
-        return false;
+
+        return $this->headers[$header];
+    }
+
+    function formatCost($cost, $format = null)
+    {
+        if ($format == null)
+            $format = $this->costFormat;
+
+        if ($format == 'percent') {
+            $total = $this->getHeader('summary');
+            $result = ($total == 0) ? 0 : ($cost * 100) / $total;
+            return number_format($result, 2, '.', '');
+        }
+
+        if ($format == 'msec') {
+            return round($cost / 1000, 0);
+        }
+
+        // Default usec
+        return $cost;
+    }
+
+    private function read($numbers = 1)
+    {
+        $values = unpack(self::NR_FORMAT . $numbers, fread($this->fp, self::NR_SIZE * $numbers));
+        if ($numbers == 1)
+            return $values[1];
+        else
+            return array_values($values); // reindex and return
+    }
+
+    private function readLine()
+    {
+        $result = fgets($this->fp);
+        if ($result)
+            return trim($result);
+        else
+            return $result;
+    }
+
+    private function seek($offset, $whence = SEEK_SET)
+    {
+        return fseek($this->fp, $offset, $whence);
+    }
+
+    static function parse($inFile, $outFile)
+    {
+        $preprocessor = Webgrind_Config::getBinaryPreprocessor();
+        if (!is_executable($preprocessor)) {
+            return false;
+        }
+
+        $cmd = escapeshellarg($preprocessor) . ' ' . escapeshellarg($inFile) . ' ' . escapeshellarg($outFile);
+        foreach (Webgrind_Config::$proxyFunctions as $function) {
+            $cmd .= ' ' . escapeshellarg($function);
+        }
+        exec($cmd, $output, $ret);
+        if ($ret == 0) {
+            return;
+        }
+
+        $in = @fopen($inFile, 'rb');
+        if (!$in)
+            throw new Exception('Could not open ' . $inFile . ' for reading.');
+        $out = @fopen($outFile, 'w+b');
+        if (!$out)
+            throw new Exception('Could not open ' . $outFile . ' for writing.');
+
+        $proxyFunctions = array_flip(Webgrind_Config::$proxyFunctions);
+        $proxyQueue = [];
+        $nextFuncNr = 0;
+        $functionNames = [];
+        $functions = [];
+        $headers = [];
+
+        // Read information into memory
+        while (($line = fgets($in))) {
+            if (substr($line, 0, 3) === 'fl=') {
+                // Found invocation of function. Read function name
+                fscanf($in, "fn=%[^\n\r]s", $function);
+                $function = self::getCompressedName($function, false);
+                // Special case for ENTRY_POINT - it contains summary header
+                if (self::ENTRY_POINT == $function) {
+                    fgets($in);
+                    $headers[] = fgets($in);
+                    fgets($in);
+                }
+                // Cost line
+                fscanf($in, "%d %d", $lnr, $cost);
+
+                if (!isset($functionNames[$function])) {
+                    $index = $nextFuncNr++;
+                    $functionNames[$function] = $index;
+                    if (isset($proxyFunctions[$function])) {
+                        $proxyQueue[$index] = array();
+                    }
+                    $functions[$index] = array(
+                        'filename' => self::getCompressedName(substr(trim($line), 3), true),
+                        'line' => $lnr,
+                        'invocationCount' => 1,
+                        'summedSelfCost' => $cost,
+                        'summedInclusiveCost' => $cost,
+                        'calledFromInformation' => array(),
+                        'subCallInformation' => array()
+                    );
+                } else {
+                    $index = $functionNames[$function];
+                    $functions[$index]['invocationCount']++;
+                    $functions[$index]['summedSelfCost'] += $cost;
+                    $functions[$index]['summedInclusiveCost'] += $cost;
+                }
+            } else if (substr($line, 0, 4) === 'cfn=') {
+                // Found call to function. ($function/$index should contain function call originates from)
+                $calledFunctionName = self::getCompressedName(substr(trim($line), 4), false);
+                // Skip call line
+                fgets($in);
+                // Cost line
+                fscanf($in, "%d %d", $lnr, $cost);
+
+                // Current function is a proxy -> skip
+                if (isset($proxyQueue[$index])) {
+                    $proxyQueue[$index][] = array(
+                        'calledIndex' => $functionNames[$calledFunctionName],
+                        'lnr' => $lnr,
+                        'cost' => $cost,
+                    );
+                    continue;
+                }
+
+                $calledIndex = $functionNames[$calledFunctionName];
+                // Called a proxy
+                if (isset($proxyQueue[$calledIndex])) {
+                    $data = array_shift($proxyQueue[$calledIndex]);
+                    $calledIndex = $data['calledIndex'];
+                    $lnr = $data['lnr'];
+                    $cost = $data['cost'];
+                }
+
+                $functions[$index]['summedInclusiveCost'] += $cost;
+
+                $key = $index . $lnr;
+                if (!isset($functions[$calledIndex]['calledFromInformation'][$key])) {
+                    $functions[$calledIndex]['calledFromInformation'][$key] = array('functionNr' => $index, 'line' => $lnr, 'callCount' => 0, 'summedCallCost' => 0);
+                }
+
+                $functions[$calledIndex]['calledFromInformation'][$key]['callCount']++;
+                $functions[$calledIndex]['calledFromInformation'][$key]['summedCallCost'] += $cost;
+
+                $calledKey = $calledIndex . $lnr;
+                if (!isset($functions[$index]['subCallInformation'][$calledKey])) {
+                    $functions[$index]['subCallInformation'][$calledKey] = array('functionNr' => $calledIndex, 'line' => $lnr, 'callCount' => 0, 'summedCallCost' => 0);
+                }
+
+                $functions[$index]['subCallInformation'][$calledKey]['callCount']++;
+                $functions[$index]['subCallInformation'][$calledKey]['summedCallCost'] += $cost;
+
+            } else if (strpos($line, ': ') !== false) {
+                // Found header
+                $headers[] = $line;
+            }
+        }
+
+        $functionNames = array_flip($functionNames);
+
+        // Write output
+        $functionCount = sizeof($functions);
+        fwrite($out, pack(self::NR_FORMAT . '*', self::FILE_FORMAT_VERSION, 0, $functionCount));
+        // Make room for function addresses
+        fseek($out, self::NR_SIZE * $functionCount, SEEK_CUR);
+        $functionAddresses = array();
+        foreach ($functions as $index => $function) {
+            $functionAddresses[] = ftell($out);
+            $calledFromCount = sizeof($function['calledFromInformation']);
+            $subCallCount = sizeof($function['subCallInformation']);
+            fwrite($out, pack(self::NR_FORMAT . '*', $function['line'], $function['summedSelfCost'], $function['summedInclusiveCost'], $function['invocationCount'], $calledFromCount, $subCallCount));
+            // Write called from information
+            foreach ((array)$function['calledFromInformation'] as $call) {
+                fwrite($out, pack(self::NR_FORMAT . '*', $call['functionNr'], $call['line'], $call['callCount'], $call['summedCallCost']));
+            }
+            // Write sub call information
+            foreach ((array)$function['subCallInformation'] as $call) {
+                fwrite($out, pack(self::NR_FORMAT . '*', $call['functionNr'], $call['line'], $call['callCount'], $call['summedCallCost']));
+            }
+
+            fwrite($out, $function['filename'] . "\n" . $functionNames[$index] . "\n");
+        }
+        $headersPos = ftell($out);
+        // Write headers
+        foreach ($headers as $header) {
+            fwrite($out, $header);
+        }
+
+        // Write addresses
+        fseek($out, self::NR_SIZE, SEEK_SET);
+        fwrite($out, pack(self::NR_FORMAT, $headersPos));
+        // Skip function count
+        fseek($out, self::NR_SIZE, SEEK_CUR);
+        // Write function addresses
+        foreach ($functionAddresses as $address) {
+            fwrite($out, pack(self::NR_FORMAT, $address));
+        }
+
+        fclose($in);
+        fclose($out);
+    }
+
+    static function getCompressedName($name, $isFile)
+    {
+        global $compressedNames;
+        if (!preg_match("/\((\d+)\)(.+)?/", $name, $matches)) {
+            return $name;
+        }
+        $functionIndex = $matches[1];
+        if (isset($matches[2])) {
+            $compressedNames[$isFile][$functionIndex] = trim($matches[2]);
+        } else if (!isset($compressedNames[$isFile][$functionIndex])) {
+            return $name; // should not happen - is file valid?
+        }
+        return $compressedNames[$isFile][$functionIndex];
     }
 }
 
-require __DIR__ . '/FileHandler.php';
+class Webgrind_FileHandler
+{
+
+    private static $singleton = null;
+
+    public static function getInstance()
+    {
+        if (self::$singleton == null)
+            self::$singleton = new self();
+        return self::$singleton;
+    }
+
+    private function __construct()
+    {
+        // Get list of files matching the defined format
+        $files = $this->getFiles(Webgrind_Config::xdebugOutputFormat(), Webgrind_Config::xdebugOutputDir());
+
+        // Get list of preprocessed files
+        $prepFiles = $this->getPrepFiles('/\\' . Webgrind_Config::$preprocessedSuffix . '$/', Webgrind_Config::storageDir());
+        // Loop over the preprocessed files.
+        foreach ($prepFiles as $fileName => $prepFile) {
+            $fileName = str_replace(Webgrind_Config::$preprocessedSuffix, '', $fileName);
+
+            // If it is older than its corrosponding original: delete it.
+            // If it's original does not exist: delete it
+            if (!isset($files[$fileName]) || $files[$fileName]['mtime'] > $prepFile['mtime'])
+                unlink($prepFile['absoluteFilename']);
+            else
+                $files[$fileName]['preprocessed'] = true;
+        }
+        // Sort by mtime
+        uasort($files, function ($a, $b) {
+            if ($a['mtime'] == $b['mtime'])
+                return 0;
+
+            return ($a['mtime'] > $b['mtime']) ? -1 : 1;
+        });
+
+        $this->files = $files;
+    }
+
+    private function getInvokeUrl($file)
+    {
+        if (preg_match('/\.webgrind$/', $file))
+            return 'Webgrind internal';
+
+        // Grab name of invoked file.
+        $fp = fopen($file, 'r');
+        $invokeUrl = '';
+        while ((($line = fgets($fp)) !== FALSE) && !strlen($invokeUrl)) {
+            if (preg_match('/^cmd: (.*)$/', $line, $parts)) {
+                $invokeUrl = isset($parts[1]) ? $parts[1] : '';
+            }
+        }
+        fclose($fp);
+        if (!strlen($invokeUrl))
+            $invokeUrl = 'Unknown!';
+
+        return $invokeUrl;
+    }
+
+    private function getFiles($format, $dir)
+    {
+        $list = preg_grep($format, scandir($dir));
+        $files = array();
+
+        # Moved this out of loop to run faster
+        if (function_exists('xdebug_get_profiler_filename'))
+            $selfFile = realpath(xdebug_get_profiler_filename());
+        else
+            $selfFile = '';
+
+        foreach ($list as $file) {
+            $absoluteFilename = $dir . $file;
+
+            // Exclude webgrind preprocessed files
+            if (false !== strstr($absoluteFilename, Webgrind_Config::$preprocessedSuffix))
+                continue;
+
+            // Make sure that script never parses the profile currently being generated. (infinite loop)
+            if ($selfFile == realpath($absoluteFilename))
+                continue;
+
+            $invokeUrl = rtrim($this->getInvokeUrl($absoluteFilename));
+            if (Webgrind_Config::$hideWebgrindProfiles && $invokeUrl == dirname(dirname(__FILE__)) . DIRECTORY_SEPARATOR . 'index.php')
+                continue;
+
+            $files[$file] = array('absoluteFilename' => $absoluteFilename,
+                'mtime' => filemtime($absoluteFilename),
+                'preprocessed' => false,
+                'invokeUrl' => $invokeUrl,
+                'filesize' => $this->bytestostring(filesize($absoluteFilename))
+            );
+        }
+        return $files;
+    }
+
+    private function getPrepFiles($format, $dir)
+    {
+        $list = preg_grep($format, scandir($dir));
+        $files = array();
+
+        foreach ($list as $file) {
+            $absoluteFilename = $dir . $file;
+
+            // Make sure that script does not include the profile currently being generated. (infinite loop)
+            if (function_exists('xdebug_get_profiler_filename') && realpath(xdebug_get_profiler_filename()) == realpath($absoluteFilename))
+                continue;
+
+            $files[$file] = array('absoluteFilename' => $absoluteFilename,
+                'mtime' => filemtime($absoluteFilename),
+                'preprocessed' => true,
+                'filesize' => $this->bytestostring(filesize($absoluteFilename))
+            );
+        }
+        return $files;
+    }
+
+    public function getTraceList()
+    {
+        $result = array();
+        foreach ($this->files as $fileName => $file) {
+            $result[] = array('filename' => $fileName,
+                'invokeUrl' => str_replace($_SERVER['DOCUMENT_ROOT'] . '/', '', $file['invokeUrl']),
+                'filesize' => $file['filesize'],
+                'mtime' => date(Webgrind_Config::$dateFormat, $file['mtime'])
+            );
+        }
+        return $result;
+    }
+
+    public function getTraceReader($file, $costFormat)
+    {
+        $prepFile = Webgrind_Config::storageDir() . $file . Webgrind_Config::$preprocessedSuffix;
+        try {
+            $r = new Webgrind_Reader($prepFile, $costFormat);
+        } catch (Exception $e) {
+            // Preprocessed file does not exist or other error
+            Webgrind_Reader::parse(Webgrind_Config::xdebugOutputDir() . $file, $prepFile);
+            $r = new Webgrind_Reader($prepFile, $costFormat);
+        }
+        return $r;
+    }
+
+    private function bytestostring($size, $precision = 0)
+    {
+        $sizes = array('YB', 'ZB', 'EB', 'PB', 'TB', 'GB', 'MB', 'KB', 'B');
+        $total = count($sizes);
+
+        while ($total-- && $size > 1024) {
+            $size /= 1024;
+        }
+        return round($size, $precision) . $sizes[$total];
+    }
+}
 
 set_time_limit(0);
 
@@ -265,6 +751,7 @@ try {
                     $functions[$i]['humanKind'] = $humanKind;
                 }
             }
+
             usort($functions, function ($a, $b) {
                 $a = $a['summedSelfCostRaw'];
                 $b = $b['summedSelfCostRaw'];
@@ -285,6 +772,7 @@ try {
                 if ($remainingCost < 0)
                     break;
             }
+
             $result['summedInvocationCount'] = $reader->getFunctionCount();
             $result['summedRunTime'] = $reader->formatCost($reader->getHeader('summary'), 'msec');
             $result['dataFile'] = $dataFile;
@@ -350,13 +838,12 @@ try {
             if (!file_exists(Webgrind_Config::xdebugOutputDir()) || !is_readable(Webgrind_Config::xdebugOutputDir())) {
                 $welcome .= 'Webgrind $profilerDir does not exist or is not readable: <code>' . Webgrind_Config::xdebugOutputDir() . '</code><br>';
             }
-
             if (empty($welcome)) {
                 $welcome = 'Select a cachegrind file above<br>(looking in <code>' . Webgrind_Config::xdebugOutputDir() . '</code> for files matching <code>' . Webgrind_Config::xdebugOutputFormat() . '</code>)';
             }
     }
 } catch (Exception $e) {
-    sendJson(['error' => $e->getMessage() . '<br>' . $e->getFile() . ', line ' . $e->getLine()]);
+    sendJson(['error' => $e->getMessage() . '<br>' . $e->getFile() . ' @ line ' . $e->getLine()]);
     return;
 }
 ?>
@@ -368,7 +855,6 @@ try {
     <style>
         body {
             font-family: monospace;
-            font-size: 12px;
             color: #000000;
             margin: 0;
         }
@@ -378,7 +864,7 @@ try {
             text-decoration: none;
         }
 
-        a:hover, #footer a {
+        a:hover {
             text-decoration: underline;
         }
 
@@ -416,9 +902,6 @@ try {
         #options {
             float: right;
             padding: 10px 0 0 0;
-        }
-
-        #options form {
             margin: 0;
         }
 
@@ -515,42 +998,32 @@ try {
         <h1>webgrind<sup style="font-size:10px">v<?php echo Webgrind_Config::$webgrindVersion ?></sup></h1>
         <p>profiling in the browser</p>
     </div>
-    <div id="options">
-        <form method="get" onsubmit="window.location.hash='';update();return false;">
-            <div style="float:right;margin-left:10px">
-                <label for="showFraction" style="margin:0 5px">Show</label>
-                <select id="showFraction" name="showFraction">
-                    <?php foreach (array(100, 99.7, 98, 95, 90, 82, 68, 50, 26) as $i): ?>
-                        <option value="<?php echo $i / 100 ?>"
-                                <?php if ($i == Webgrind_Config::$defaultFunctionPercentage): ?>selected="selected"<?php endif; ?>><?php echo $i ?>%
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-                <label for="dataFile" style="margin:0 5px">of</label>
-                <select id="dataFile" name="dataFile" style="width:200px">
-                    <option value="0">Auto (newest)</option>
-                    <?php foreach (Webgrind_FileHandler::getInstance()->getTraceList() as $trace): ?>
-                        <option value="<?php echo $trace['filename'] ?>"><?php echo str_replace(array('%i', '%f', '%s', '%m'), array($trace['invokeUrl'], $trace['filename'], $trace['filesize'], $trace['mtime']), Webgrind_Config::$traceFileListFormat); ?></option>
-                    <?php endforeach; ?>
-                </select>
-                <img alt="Reload the file list" class="list_reload" src="img/reload.png" onclick="reloadFilelist()">
-                <label for="costFormat" style="margin:0 5px">in</label>
-                <select id="costFormat" name="costFormat">
-                    <option value="percent" <?php echo (Webgrind_Config::$defaultCostformat == 'percent') ? 'selected' : '' ?>>
-                        percent
-                    </option>
-                    <option value="msec" <?php echo (Webgrind_Config::$defaultCostformat == 'msec') ? 'selected' : '' ?>>
-                        milliseconds
-                    </option>
-                    <option value="usec" <?php echo (Webgrind_Config::$defaultCostformat == 'usec') ? 'selected' : '' ?>>
-                        microseconds
-                    </option>
-                </select>
-                <input type="submit" value="Update">
-                <input type="button" value="&#10006;" onclick="clearFiles()">
-            </div>
-        </form>
-    </div>
+    <form id="options" method="get" onsubmit="window.location.hash='';update();return false;">
+        <div style="float:right;margin-left:10px">
+            <label for="showFraction" style="margin:0 5px">Show</label>
+            <select id="showFraction" name="showFraction">
+                <?php foreach (array(100, 99.7, 98, 95, 90, 82, 68, 50, 26) as $i): ?>
+                    <option value="<?php echo $i / 100 ?>" <?php if ($i == Webgrind_Config::$defaultFunctionPercentage): ?>selected="selected"<?php endif; ?>><?php echo $i ?>%</option>
+                <?php endforeach; ?>
+            </select>
+            <label for="dataFile" style="margin:0 5px">of</label>
+            <select id="dataFile" name="dataFile" style="width:200px">
+                <option value="0">Auto (newest)</option>
+                <?php foreach (Webgrind_FileHandler::getInstance()->getTraceList() as $trace): ?>
+                    <option value="<?php echo $trace['filename'] ?>"><?php echo str_replace(array('%i', '%f', '%s', '%m'), array($trace['invokeUrl'], $trace['filename'], $trace['filesize'], $trace['mtime']), Webgrind_Config::$traceFileListFormat); ?></option>
+                <?php endforeach; ?>
+            </select>
+            <img alt="Reload the file list" class="list_reload" src="img/reload.png" onclick="reloadFilelist()">
+            <label for="costFormat" style="margin:0 5px">in</label>
+            <select id="costFormat" name="costFormat">
+                <option value="percent" <?php echo (Webgrind_Config::$defaultCostformat == 'percent') ? 'selected' : '' ?>>percent</option>
+                <option value="msec" <?php echo (Webgrind_Config::$defaultCostformat == 'msec') ? 'selected' : '' ?>>milliseconds</option>
+                <option value="usec" <?php echo (Webgrind_Config::$defaultCostformat == 'usec') ? 'selected' : '' ?>>microseconds</option>
+            </select>
+            <input type="submit" value="Update">
+            <input type="button" value="&#10006;" onclick="clearFiles()">
+        </div>
+    </form>
     <div style="clear:both;"></div>
 </div>
 <div id="main">
@@ -558,7 +1031,6 @@ try {
         <div style="float:left;">
             <h2 id="invoke_url"></h2>
             <span id="data_file"></span> @ <span id="mtime"></span>
-            <br/>
             <p>
                 <label for="callfilter">Filter:</label>
                 <input type="text" style="width:150px" id="callfilter"> (regex too)
@@ -646,7 +1118,7 @@ try {
                             'Average Inclusive Cost' => 'sprintf("%.2f", rowData.summedInclusiveCost/data.invocationCount)',
                         );
                         foreach (Webgrind_Config::$tableFields as $field) {
-                            echo "<td class=\"nr\">'+$dataCodes[$field]+'</td> \\\n\t\t\t\t\t\t";
+                            echo "<td class=\"nr\">'.$dataCodes[$field].'</td>";
                         }
                         ?>
                         < /tr>';
